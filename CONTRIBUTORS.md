@@ -442,6 +442,9 @@ Listed by first contribution. PR numbers link the work.
 - **Erol Tasci** ([@Voyagerroc-Lab](https://github.com/Voyagerroc-Lab))
   - First contribution. Several command-table entries in `docs/commands.md` ran two commands onto a single line, so a reader scanning the table saw one entry where there were two and **the second command was effectively undocumented** ([#970](https://github.com/MakazhanAlpamys/Soup/issues/970)). Worth recording that one of the two reasons the maintainer gave when filing that issue was wrong, and was corrected in review rather than left standing. ([#972](https://github.com/MakazhanAlpamys/Soup/pull/972))
 
+- **Shubham Bhardwaj** ([@shubhambhar007](https://github.com/shubhambhar007))
+  - First contribution. MCP tool errors for an invalid export format, GPU name or data format said only that the value was unknown. They now name the rejected value and list the accepted ones, taken from the live allowlists. **They checked the real CLI output before changing either side:** the data-format list uses the same order `soup data validate` prints, while export formats and GPU names stay sorted, and the test that claims to match `data validate` now compares against it. They also caught that the GPU normaliser strips "gpu", which meant a `NEW-GPU` fixture had never been testing an unknown card ([#953](https://github.com/MakazhanAlpamys/Soup/issues/953), [#954](https://github.com/MakazhanAlpamys/Soup/pull/954))
+
 ---
 
 Want to join this list? See [CONTRIBUTING.md](CONTRIBUTING.md) — good first issues are
