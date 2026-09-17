@@ -446,6 +446,9 @@ Listed by first contribution. PR numbers link the work.
 - **Shubham Bhardwaj** ([@shubhambhar007](https://github.com/shubhambhar007))
   - First contribution. MCP tool errors for an invalid export format, GPU name or data format said only that the value was unknown. They now name the rejected value and list the accepted ones, taken from the live allowlists. **They checked the real CLI output before changing either side:** the data-format list uses the same order `soup data validate` prints, while export formats and GPU names stay sorted, and the test that claims to match `data validate` now compares against it. They also caught that the GPU normaliser strips "gpu", which meant a `NEW-GPU` fixture had never been testing an unknown card ([#953](https://github.com/MakazhanAlpamys/Soup/issues/953), [#954](https://github.com/MakazhanAlpamys/Soup/pull/954))
 
+- **Daniel** ([@MrBeldum](https://github.com/MrBeldum))
+  - First contribution. `docs/commands.md` was missing 23 registered commands. They documented all of them and added a guard that walks the live Typer tree and fails when a command lands without an entry row. **The part worth recording is the matcher.** Review found its first version could be satisfied by prose, by a longer command sharing a prefix, and by shorthand leaking across argument slots. They rewrote it before the maintainer's deadline instead of waiting for the maintainer's own fix, and their version turned out stricter than that fix in four places, all in the safe direction. Their advise special case is anchored to its own row and tied to the live CLI by a test. They could not rebase onto `main` from their token, and said so plainly; the maintainer moved the changelog fragment for them ([#822](https://github.com/MakazhanAlpamys/Soup/issues/822), [#855](https://github.com/MakazhanAlpamys/Soup/pull/855))
+
 ---
 
 Want to join this list? See [CONTRIBUTING.md](CONTRIBUTING.md) — good first issues are
