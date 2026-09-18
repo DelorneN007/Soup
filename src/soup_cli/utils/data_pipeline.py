@@ -23,6 +23,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import inspect
+import json
 import logging
 import math
 import os
@@ -192,10 +193,29 @@ def validate_shards(value: Optional[int]) -> Optional[int]:
 # Bump whenever the on-disk tokenization of a preprocessed row changes, so a
 # dataset cached under an older encoding is never silently reused. v2 (#785):
 # the chat path still tokenizes with the tokenizer's default add_special_tokens=True
-# (so the cache stays byte-identical to older behaviour on EOS and truncation) but
-# now strips the one doubled leading BOS the chat template already rendered, so a
-# row that used to bake in [bos, bos, ...] no longer does.
-_PREPROCESS_TOKENIZE_SCHEMA = "v2"
+# but now strips the one doubled leading BOS the chat template already rendered, so a
+# row that used to bake in [bos, bos, ...] no longer does. v3 (#791): the chat path
+# now also applies TRL's ``add_eos`` rule — a chat row that does not already end on
+# the EOS gets one appended — so a cache built before this no longer trains without a
+# stop token on templates that render none (the Qwen shape). A v2 cache is rejected.
+_PREPROCESS_TOKENIZE_SCHEMA = "v3"
+
+
+def preprocess_dataset_key_input(data_cfg: Any) -> str:
+    """The ``dataset_path`` input both sides of the preprocess cache hash (#443, #1038).
+
+    A list ``data.train`` folds ``data.interleave``'s strategy/probs into the key,
+    since the same file set under a different mixture must not collide on a stale,
+    mis-mixed cache entry. ``soup data preprocess`` and the ``pre_tokenized``
+    training gate both call this, so they cannot hash a list differently: the gate
+    once passed the raw list and ``make_preprocess_cache_key`` raised.
+    """
+    if isinstance(data_cfg.train, list):
+        return json.dumps(
+            {"train": data_cfg.train, "interleave": data_cfg.interleave},
+            sort_keys=True,
+        )
+    return data_cfg.train
 
 
 def make_preprocess_cache_key(

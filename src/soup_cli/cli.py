@@ -60,6 +60,7 @@ from soup_cli.commands import (  # noqa: E402
 from soup_cli.commands import monitor as monitor_cmd  # noqa: E402
 from soup_cli.commands import quantize as quantize_cmd  # noqa: E402
 from soup_cli.commands import quickstart as quickstart_cmd  # noqa: E402
+from soup_cli.commands import rewind as rewind_cmd  # noqa: E402
 from soup_cli.commands import spectrum as spectrum_cmd  # noqa: E402
 from soup_cli.commands import (  # noqa: E402
     tui as tui_cmd,
@@ -142,6 +143,7 @@ app.add_typer(
 )
 app.command(name="history")(history.history)
 app.command(name="why")(why_cmd.why)
+app.command(name="rewind")(rewind_cmd.rewind)
 app.command(name="tui")(tui_cmd.tui)
 app.add_typer(
     spectrum_cmd.app, name="spectrum",
@@ -531,6 +533,11 @@ data.app.command(name="topics")(_data_topics_cmd.topics)
 from soup_cli.commands import data_canary as _data_canary_cmd  # noqa: E402
 
 data.app.add_typer(_data_canary_cmd.app, name="canary")
+
+# Automated Dataset Cleaning & Sanity Repair Pipeline.
+from soup_cli.commands import data_clean as _data_clean_cmd  # noqa: E402
+
+data.app.command(name="clean")(_data_clean_cmd.clean)
 
 # v0.71.28 — MCP server: drive Soup from any MCP client (Claude Code / Cursor /
 # Cline / Continue) over stdio.

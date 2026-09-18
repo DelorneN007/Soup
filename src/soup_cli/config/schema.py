@@ -641,10 +641,12 @@ class DataConfig(BaseModel):
         ),
     )
     remove_unused_columns: bool = Field(
-        default=True,
+        default=False,
         description=(
-            "HF Trainer remove_unused_columns. Set False when feeding "
-            "extra cols to a custom collator. (v0.42.0 Part E)"
+            "HF Trainer remove_unused_columns. No trainer reads this field; the "
+            "trainers that set it pass False so a custom collator can still see "
+            "the extra columns. An explicit `true` loads with a warning and is "
+            "ignored, and a later release refuses it. (v0.42.0 Part E; #759)"
         ),
     )
     prompt_strategy: Optional[str] = Field(
@@ -934,6 +936,29 @@ class DataConfig(BaseModel):
                 "at a cache directory produced by `soup data preprocess`."
             )
         return self
+
+    @field_validator("remove_unused_columns", mode="after")
+    @classmethod
+    def _ignore_remove_unused_columns_true(cls, value: bool) -> bool:
+        """``true`` never took effect: warn, and load it as ``false`` (#759).
+
+        No trainer reads this field; the trainers that set the HF argument pass
+        ``False`` so a custom collator still receives the columns the model's
+        ``forward()`` does not name. The declared default used to say ``True``,
+        so ``soup autopilot`` wrote ``remove_unused_columns: true`` into every
+        config it generated. Refusing that would break files Soup wrote itself,
+        so for one release an explicit ``true`` loads, is ignored, and says so.
+        The release that refuses it is named once, in ``config/deprecation.py``.
+        """
+        if value:
+            from soup_cli.config.deprecation import warn_deprecated_value
+
+            warn_deprecated_value(
+                "data.remove_unused_columns: true has no effect and is ignored "
+                "(no trainer reads it; the trainers that set it pass false). "
+                "Delete the line."
+            )
+        return False
 
 
 class AdviseConfig(BaseModel):
@@ -1759,6 +1784,22 @@ class TrainingConfig(BaseModel):
             "teacher)."
         ),
     )
+    distill_chunk_size: Optional[int] = Field(
+        default=None,
+        description=(
+            "Token chunk size for evaluating the distillation divergence kernel. "
+            "Chunks the active supervised tokens to reduce peak memory retention. "
+            "Unset (None) processes all tokens in a single chunk. (#722)"
+        ),
+    )
+    distill_checkpoint: bool = Field(
+        default=False,
+        description=(
+            "Enable non-reentrant activation checkpointing per token chunk during "
+            "distillation divergence computation to minimize autograd retained "
+            "memory. (#722)"
+        ),
+    )
     # v0.71.12 #146 — opt-in LoRA / PEFT path for classifier-family tasks.
     classifier_lora: bool = Field(
         default=False,
@@ -2548,6 +2589,36 @@ class TrainingConfig(BaseModel):
 
         return validate_distill_mode(v)
 
+    @field_validator("distill_chunk_size", mode="before")
+    @classmethod
+    def _validate_distill_chunk_size(cls, v):
+        """v0.74.0 #722 — positive integer token chunk size, rejecting bool."""
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("training.distill_chunk_size must not be bool")
+        if not isinstance(v, int):
+            raise ValueError(
+                f"training.distill_chunk_size must be int, got {type(v).__name__}"
+            )
+        if v < 1:
+            raise ValueError(
+                f"training.distill_chunk_size must be >= 1, got {v}"
+            )
+        return v
+
+    @field_validator("distill_checkpoint", mode="before")
+    @classmethod
+    def _validate_distill_checkpoint(cls, v):
+        """v0.74.0 #722 — boolean activation checkpointing flag."""
+        if v is None:
+            return False
+        if not isinstance(v, bool):
+            raise ValueError(
+                f"training.distill_checkpoint must be bool, got {type(v).__name__}"
+            )
+        return v
+
     @field_validator("mod_capacity_factor", mode="before")
     @classmethod
     def _validate_mod_capacity_factor(cls, v):
@@ -2948,12 +3019,23 @@ class TrainingConfig(BaseModel):
         le=1000,
         description="Consecutive high-loss steps before stopping",
     )
+    # Flight recorder read by `soup rewind`
+    rewind_log: bool = Field(
+        default=True,
+        description=(
+            "Write <output>/rewind.jsonl: the dataset rows in every training "
+            "micro-batch with each row's loss, read by `soup rewind` to name the "
+            "rows behind a loss spike. SFT only (transformers and MLX, single "
+            "process); resumed runs and packing turn it off with one warning."
+        ),
+    )
     # Loss spike auto-recovery (v0.32.0 Part E) — extends watchdog
     loss_spike_recovery: bool = Field(
         default=False,
         description=(
-            "On watchdog trigger: rollback to last checkpoint, decay LR, "
-            "and resume (instead of stopping). Requires loss_watchdog=true."
+            "On watchdog trigger: write <output>/spike_recovery.json with "
+            "decayed LR and attempt count for re-launch (instead of bare stop). "
+            "Requires loss_watchdog=true."
         ),
     )
     loss_spike_recovery_max_attempts: int = Field(
@@ -4289,6 +4371,24 @@ def remap_root_level_misplaced_keys(values):
     return new_values
 
 
+# task values whose trainer wrapper subclasses SFTTrainerWrapper and so reads
+# training.use_flash_attn / training.use_liger (sft.py:_setup_transformers,
+# inherited by tts.py via super()). Every other task ignores both fields.
+SFT_KERNEL_AWARE_TASKS: frozenset[str] = frozenset({"sft", "tts"})
+
+
+# #795: trainers that load the base at checkpoint precision and never read
+# ``training.quantization``.
+_QUANTIZATION_UNHONOURED_TASKS = frozenset({
+    "distill", "classifier", "reranker", "cross_encoder", "prm",
+    "moe_lora_routing", "unlearn", "asr",
+})
+
+#: The bitsandbytes values: ``4bit`` was the default, so every config Soup dumped
+#: for these tasks carries one of them literally (#795 review).
+_BNB_QUANTIZATION_VALUES = frozenset({"4bit", "8bit"})
+
+
 class SoupConfig(BaseModel):
     """Root config for soup.yaml."""
 
@@ -4359,9 +4459,91 @@ class SoupConfig(BaseModel):
         return value
 
     @model_validator(mode="after")
+    def _resolve_quantization_for_unhonouring_tasks(self) -> "SoupConfig":
+        """#795 — these trainers load the base at checkpoint precision and never
+        read ``training.quantization``.
+
+        The field defaults to ``4bit``, so an UNSET value resolves to ``none`` here
+        -- a minimal config still parses, and the stored config, config hash and
+        registry entry say what actually trained. A dumped config carries the
+        resolved ``none`` and reloads.
+
+        An explicit bitsandbytes value (``4bit``, ``8bit``, or ``load_in_8bit:
+        true``, which rewrites the field to ``8bit``) loads with a warning and
+        resolves to ``none``, rather than being refused. Every config Soup dumped
+        while ``4bit`` was the default carries it literally -- stored run configs,
+        ``train --replay`` -- and refusing those would break files Soup wrote
+        itself. The release that refuses it is named in ``config/deprecation.py``.
+        A quant-menu value (``gptq``, ``awq``, ...) was never a default Soup wrote,
+        so it is still refused.
+
+        Runs before every other ``SoupConfig`` validator so the ones that read
+        ``quantization`` see the resolved value. In particular it must stay before
+        ``_validate_peft_variant_backend_and_quantization`` if that lands (#1037).
+        """
+        if self.task not in _QUANTIZATION_UNHONOURED_TASKS:
+            return self
+        tcfg = self.training
+        if tcfg.quantization == "none":
+            return self
+        # ``bnb_4bit_quant_storage`` is checked against ``quantization`` by a
+        # TrainingConfig validator that has already run on the unresolved default,
+        # so it passed; setting it is a request for 4-bit and is refused here
+        # rather than left meaning nothing. (``bnb_4bit_use_double_quant`` and
+        # ``llm_int8`` are checked by SoupConfig validators that run after this one.)
+        if tcfg.bnb_4bit_quant_storage is None:
+            if "quantization" not in tcfg.model_fields_set:
+                tcfg.quantization = "none"
+                return self
+            if tcfg.quantization in _BNB_QUANTIZATION_VALUES:
+                from soup_cli.config.deprecation import warn_deprecated_value
+
+                warn_deprecated_value(
+                    f"training.quantization: {tcfg.quantization} has no effect on "
+                    f"task={self.task!r} and is ignored: its trainer loads the base at "
+                    "checkpoint precision, so the run trains unquantised. Set "
+                    "quantization: none."
+                )
+                tcfg.quantization = "none"
+                return self
+        raise ValueError(
+            f"task={self.task!r} does not apply training.quantization: its trainer "
+            "loads the base at checkpoint precision, so "
+            f"quantization={tcfg.quantization!r} would record a quantised run that "
+            "never happens. Remove it or set quantization: none."
+        )
+
+    @model_validator(mode="after")
+    def _validate_prm_lora_block(self) -> "SoupConfig":
+        """#795 — ``trainer/prm.py`` never reads ``training.lora``: every base
+        parameter trains. A LoRA block that differs from the schema default is
+        decorative and refused; ``r: 0`` states full fine-tuning, which is what
+        PRM does, so it is allowed. The default block is not intent -- a dumped
+        config writes it out -- so it is compared by value, not by fields-set."""
+        if self.task != "prm":
+            return self
+        lora = self.training.lora
+        if lora == LoraConfig() or lora.r == 0:
+            return self
+        raise ValueError(
+            "task='prm' does not apply training.lora: the PRM trainer fine-tunes "
+            "every base parameter. Remove the lora block (or set lora.r: 0)."
+        )
+
+    @model_validator(mode="after")
     def _validate_chat_template_supported_tasks(self) -> "SoupConfig":
         """Reject chat-template overrides on trainers that never render chat."""
-        unsupported = {"pretrain", "embedding", "classifier", "reranker", "cross_encoder"}
+        unsupported = {
+            "pretrain",
+            "embedding",
+            "classifier",
+            "reranker",
+            "cross_encoder",
+            "prm",
+            "asr",
+            "moe_lora_routing",
+            "unlearn",
+        }
         if (
             self.data.chat_template is not None
             and self.task in unsupported
@@ -4409,8 +4591,6 @@ class SoupConfig(BaseModel):
             offenders.append('quantization_aware="fp8"')
         if tcfg.activation_offloading is not None:
             offenders.append("activation_offloading")
-        if tcfg.kernel_auto_compose:
-            offenders.append("kernel_auto_compose")
         if not offenders:
             return self
         # Distinct reasons get distinct messages so users don't waste time
@@ -4811,6 +4991,8 @@ class SoupConfig(BaseModel):
             or tcfg.distill_divergence is not None
             or tcfg.distill_temperature is not None
             or distill_mode_set
+            or tcfg.distill_chunk_size is not None
+            or bool(tcfg.distill_checkpoint)
         )
         if self.task == "distill":
             from soup_cli.utils.distill import validate_distill_compat
@@ -4823,6 +5005,37 @@ class SoupConfig(BaseModel):
                 )
             except ValueError as exc:
                 raise ValueError(str(exc)) from exc
+
+            chunk_offenders = [
+                name
+                for name, val in (
+                    ("distill_chunk_size", tcfg.distill_chunk_size),
+                    (
+                        "distill_checkpoint",
+                        tcfg.distill_checkpoint if tcfg.distill_checkpoint else None,
+                    ),
+                )
+                if val is not None
+            ]
+            if chunk_offenders:
+                if tcfg.uld_strategy is not None:
+                    raise ValueError(
+                        f"Distillation fields {chunk_offenders} are incompatible with "
+                        f"training.uld_strategy={tcfg.uld_strategy!r}; "
+                        "chunked evaluation applies only to standard token-level distillation"
+                    )
+                if tcfg.minillm_enabled:
+                    raise ValueError(
+                        f"Distillation fields {chunk_offenders} are incompatible with "
+                        "training.minillm_enabled=True; "
+                        "chunked evaluation applies only to standard token-level distillation"
+                    )
+                if tcfg.distill_mode == "sequence":
+                    raise ValueError(
+                        f"Distillation fields {chunk_offenders} are incompatible with "
+                        "training.distill_mode='sequence'; "
+                        "chunked evaluation applies only to token-level distillation"
+                    )
             return self
         if distill_fields_set:
             offenders = [
@@ -4831,6 +5044,11 @@ class SoupConfig(BaseModel):
                     ("distill_divergence", tcfg.distill_divergence),
                     ("distill_temperature", tcfg.distill_temperature),
                     ("distill_mode", tcfg.distill_mode if distill_mode_set else None),
+                    ("distill_chunk_size", tcfg.distill_chunk_size),
+                    (
+                        "distill_checkpoint",
+                        tcfg.distill_checkpoint if tcfg.distill_checkpoint else None,
+                    ),
                 ) if value is not None
             ]
             raise ValueError(
@@ -4844,17 +5062,11 @@ class SoupConfig(BaseModel):
         """v0.52.0 Part D — ``quantization='bitnet_1.58'`` gate."""
         if self.training.quantization != "bitnet_1.58":
             return self
-        from soup_cli.utils.bitnet import validate_bitnet_compat
-
-        try:
-            validate_bitnet_compat(
-                task=self.task,
-                backend=self.backend,
-                modality=self.modality,
-            )
-        except ValueError as exc:
-            raise ValueError(str(exc)) from exc
-        return self
+        raise ValueError(
+            "BitNet 1.58 training is not implemented yet; "
+            "the export path `soup export --format tq1_0` works on an "
+            "existing BitNet checkpoint."
+        )
 
     @model_validator(mode="after")
     def _validate_ebft_compat(self) -> "SoupConfig":
@@ -4918,6 +5130,25 @@ class SoupConfig(BaseModel):
             raise ValueError(
                 f"training.train_on_eot=true requires task in "
                 f"{sorted(sft_family_tasks)}; got task={self.task!r}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_kernel_flags_task_gate(self) -> "SoupConfig":
+        """#806: use_flash_attn / use_liger are read only by the SFT-family
+        trainer (sft.py, inherited by tts.py's ``TTSTrainerWrapper``); every
+        other task ignores both, so reject rather than silently no-op.
+        """
+        tcfg = self.training
+        if tcfg.use_liger and self.task not in SFT_KERNEL_AWARE_TASKS:
+            raise ValueError(
+                f"training.use_liger=true requires task in "
+                f"{sorted(SFT_KERNEL_AWARE_TASKS)}; got task={self.task!r}"
+            )
+        if tcfg.use_flash_attn and self.task not in SFT_KERNEL_AWARE_TASKS:
+            raise ValueError(
+                f"training.use_flash_attn=true requires task in "
+                f"{sorted(SFT_KERNEL_AWARE_TASKS)}; got task={self.task!r}"
             )
         return self
 
@@ -5417,6 +5648,26 @@ class SoupConfig(BaseModel):
                 "training.stream_layers is incompatible with lora.use_vera: "
                 "VeRA's shared projections are built from the materialised "
                 "base weights, which streaming keeps on the meta device."
+            )
+        # #1012 follow-up: the forward pass for a LoRA target on the streamed
+        # large-layer boundary modules (lm_head / embed_tokens) is correct
+        # (#1019), and a save -> load_adapter round trip now preserves the
+        # adapter's tensors (#1048), but save_pretrained() still raises
+        # trying to copy a meta tensor. Refuse by name at parse time rather
+        # than let a run train for hours and die at its first save_steps.
+        target_modules = tcfg.lora.target_modules
+        named_targets = (
+            {target_modules} if isinstance(target_modules, str) else set(target_modules)
+        )
+        head_targets = sorted(named_targets & {"lm_head", "embed_tokens"})
+        if head_targets:
+            raise ValueError(
+                "training.stream_layers does not yet support a LoRA target on "
+                f"{', '.join(head_targets)}: the forward pass is correct, but "
+                "saving or resuming an adapter that targets the streamed "
+                "head/embedding boundary is not supported yet. Drop "
+                f"{', '.join(head_targets)} from training.lora.target_modules, "
+                "or train without stream_layers."
             )
         if tcfg.moe_expert_quant is not None:
             raise ValueError(
@@ -6663,6 +6914,32 @@ class SoupConfig(BaseModel):
         # mutual exclusion) only when a mode is active.
         if mitigation != "off":
             _validate_reward_hack_controller(tcfg)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_callback_monitoring_task_compat(self) -> "SoupConfig":
+        """#802 — prm, moe_lora_routing, and unlearn attach no
+        SoupTrainerCallback, so reject loss_watchdog, loss_spike_recovery,
+        and grad_accum_auto_tune when set to True on these tasks.
+        """
+        unsupported = ("prm", "moe_lora_routing", "unlearn")
+        if self.task in unsupported:
+            tcfg = self.training
+            if getattr(tcfg, "loss_spike_recovery", False):
+                raise ValueError(
+                    f"training.loss_spike_recovery is not supported for task={self.task!r} "
+                    f"because {self.task!r} does not attach a live training callback"
+                )
+            if getattr(tcfg, "loss_watchdog", False):
+                raise ValueError(
+                    f"training.loss_watchdog is not supported for task={self.task!r} "
+                    f"because {self.task!r} does not attach a live training callback"
+                )
+            if getattr(tcfg, "grad_accum_auto_tune", False):
+                raise ValueError(
+                    f"training.grad_accum_auto_tune is not supported for task={self.task!r} "
+                    f"because {self.task!r} does not attach a live training callback"
+                )
         return self
 
 
