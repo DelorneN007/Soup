@@ -4376,6 +4376,18 @@ def remap_root_level_misplaced_keys(values):
 SFT_KERNEL_AWARE_TASKS: frozenset[str] = frozenset({"sft", "tts"})
 
 
+# #795: trainers that load the base at checkpoint precision and never read
+# ``training.quantization``.
+_QUANTIZATION_UNHONOURED_TASKS = frozenset({
+    "distill", "classifier", "reranker", "cross_encoder", "prm",
+    "moe_lora_routing", "unlearn", "asr",
+})
+
+#: The bitsandbytes values: ``4bit`` was the default, so every config Soup dumped
+#: for these tasks carries one of them literally (#795 review).
+_BNB_QUANTIZATION_VALUES = frozenset({"4bit", "8bit"})
+
+
 class SoupConfig(BaseModel):
     """Root config for soup.yaml."""
 
@@ -4444,6 +4456,78 @@ class SoupConfig(BaseModel):
                 "experiment_name must not contain path separators (/ \\ :) or null bytes"
             )
         return value
+
+    @model_validator(mode="after")
+    def _resolve_quantization_for_unhonouring_tasks(self) -> "SoupConfig":
+        """#795 — these trainers load the base at checkpoint precision and never
+        read ``training.quantization``.
+
+        The field defaults to ``4bit``, so an UNSET value resolves to ``none`` here
+        -- a minimal config still parses, and the stored config, config hash and
+        registry entry say what actually trained. A dumped config carries the
+        resolved ``none`` and reloads.
+
+        An explicit bitsandbytes value (``4bit``, ``8bit``, or ``load_in_8bit:
+        true``, which rewrites the field to ``8bit``) loads with a warning and
+        resolves to ``none``, rather than being refused. Every config Soup dumped
+        while ``4bit`` was the default carries it literally -- stored run configs,
+        ``train --replay`` -- and refusing those would break files Soup wrote
+        itself. The release that refuses it is named in ``config/deprecation.py``.
+        A quant-menu value (``gptq``, ``awq``, ...) was never a default Soup wrote,
+        so it is still refused.
+
+        Runs before every other ``SoupConfig`` validator so the ones that read
+        ``quantization`` see the resolved value. In particular it must stay before
+        ``_validate_peft_variant_backend_and_quantization`` if that lands (#1037).
+        """
+        if self.task not in _QUANTIZATION_UNHONOURED_TASKS:
+            return self
+        tcfg = self.training
+        if tcfg.quantization == "none":
+            return self
+        # ``bnb_4bit_quant_storage`` is checked against ``quantization`` by a
+        # TrainingConfig validator that has already run on the unresolved default,
+        # so it passed; setting it is a request for 4-bit and is refused here
+        # rather than left meaning nothing. (``bnb_4bit_use_double_quant`` and
+        # ``llm_int8`` are checked by SoupConfig validators that run after this one.)
+        if tcfg.bnb_4bit_quant_storage is None:
+            if "quantization" not in tcfg.model_fields_set:
+                tcfg.quantization = "none"
+                return self
+            if tcfg.quantization in _BNB_QUANTIZATION_VALUES:
+                from soup_cli.config.deprecation import warn_deprecated_value
+
+                warn_deprecated_value(
+                    f"training.quantization: {tcfg.quantization} has no effect on "
+                    f"task={self.task!r} and is ignored: its trainer loads the base at "
+                    "checkpoint precision, so the run trains unquantised. Set "
+                    "quantization: none."
+                )
+                tcfg.quantization = "none"
+                return self
+        raise ValueError(
+            f"task={self.task!r} does not apply training.quantization: its trainer "
+            "loads the base at checkpoint precision, so "
+            f"quantization={tcfg.quantization!r} would record a quantised run that "
+            "never happens. Remove it or set quantization: none."
+        )
+
+    @model_validator(mode="after")
+    def _validate_prm_lora_block(self) -> "SoupConfig":
+        """#795 — ``trainer/prm.py`` never reads ``training.lora``: every base
+        parameter trains. A LoRA block that differs from the schema default is
+        decorative and refused; ``r: 0`` states full fine-tuning, which is what
+        PRM does, so it is allowed. The default block is not intent -- a dumped
+        config writes it out -- so it is compared by value, not by fields-set."""
+        if self.task != "prm":
+            return self
+        lora = self.training.lora
+        if lora == LoraConfig() or lora.r == 0:
+            return self
+        raise ValueError(
+            "task='prm' does not apply training.lora: the PRM trainer fine-tunes "
+            "every base parameter. Remove the lora block (or set lora.r: 0)."
+        )
 
     @model_validator(mode="after")
     def _validate_chat_template_supported_tasks(self) -> "SoupConfig":
