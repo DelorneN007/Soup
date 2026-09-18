@@ -410,6 +410,7 @@ class GRPOTrainerWrapper:
             processing_class=self.tokenizer,
         )
         self._output_dir = str(output_dir)
+        self._batch_size = batch_size
 
     def _setup_transformers(self, cfg: SoupConfig, tcfg) -> None:
         from peft import TaskType, get_peft_model, prepare_model_for_kbit_training
@@ -468,6 +469,43 @@ class GRPOTrainerWrapper:
             bf16=getattr(self.trainer.args, "bf16", False),
         )
         self.trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+
+
+        # Add callback for live display and experiment tracking
+        if display:
+            from soup_cli.monitoring.callback import (
+                SoupTrainerCallback,
+                soup_callback_kwargs,
+            )
+
+            self.trainer.add_callback(
+                SoupTrainerCallback(
+                    display,
+                    tracker=tracker,
+                    run_id=run_id,
+                    eval_gate_config=self.config.training.eval_gate,
+                    **soup_callback_kwargs(
+                        self.config.training,
+                        batch_size=self._batch_size,
+                        output_dir=self._output_dir,
+                        include_eval_gate=False,
+                    ),
+                )
+            )
+
+        from soup_cli.utils.v028_features import activation_offloading_context
+
+        with activation_offloading_context(
+            self.config.training,
+            self._output_dir,
+        ):
+            align_trainable_dtype_for_fp16(
+                self.trainer.model,
+                fp16=getattr(self.trainer.args, "fp16", False),
+                bf16=getattr(self.trainer.args, "bf16", False),
+            )
+            self.trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+         320cc5c (fix(trainer): unify callback kwargs across all trainers (#1023))
         duration = time.time() - start
 
         self.trainer.save_model(self._output_dir)
