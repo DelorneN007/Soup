@@ -6,7 +6,7 @@ import logging
 import time
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 from rich.console import Console
 
@@ -28,17 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 def make_grpo_trainer_variant(base_cls: type, variant: str) -> type:
-    """v0.53.11 #123 — build a ``_GRPOTrainerVariant`` subclass.
-
-    Returns a subclass of ``trl.GRPOTrainer`` whose ``compute_loss`` routes
-    through :func:`soup_cli.utils.grpo_variants.apply_variant_loss`. Cached
-    so multiple instantiations with the same (base, variant) share one class.
-
-    Pure factory — no torch / trl imports at module load time. Variant
-    name is normalised via ``validate_grpo_variant`` BEFORE the cache
-    boundary so ``"GSPO"`` and ``"gspo"`` share one class (security review
-    MEDIUM fix).
-    """
+    """v0.53.11 #123 — build a ``_GRPOTrainerVariant`` subclass."""
     from soup_cli.utils.grpo_variants import validate_grpo_variant
 
     variant = validate_grpo_variant(variant)
@@ -54,37 +44,20 @@ def _make_grpo_trainer_variant_cached(base_cls: type, variant: str) -> type:
         """GRPOTrainer subclass that routes compute_loss through Soup's variants."""
 
         _soup_grpo_variant: str = variant
-        # v0.71.11 #159 — one-shot WARNING flag so a silent fallback to the
-        # stock TRL loss surfaces exactly once (not on every step).
         _soup_fallback_warned: bool = False
 
         def _warn_fallback(self, reason: str) -> None:
-            """Emit a one-shot WARNING when the variant kernel falls back.
-
-            v0.71.11 #159 — when a TRL internal rename or a kernel error
-            makes ``compute_loss`` delegate to the stock GRPO loss, the
-            operator's selected variant silently stops applying. Warn once
-            so the run isn't quietly training the wrong objective.
-            """
             if self._soup_fallback_warned:
                 return
             self._soup_fallback_warned = True
             logger.warning(
                 "GRPO variant %r compute_loss fell back to the stock TRL "
-                "loss (%s); the selected objective is NOT being applied. "
-                "This usually means a TRL version renamed the per-token "
-                "log-prob inputs.",
+                "loss (%s); the selected objective is NOT being applied.",
                 self._soup_grpo_variant,
                 reason,
             )
 
         def _compute_variant_loss(self, model, inputs):
-            """Evaluate the requested GRPO variant loss on the batch.
-
-            Reuses TRL's ``_get_per_token_logps_and_entropies`` to obtain
-            per-token log probabilities in a single forward pass without
-            duplicating forward computation or allocating extra VRAM.
-            """
             logp_new = _read_attr(inputs, "per_token_logps")
             prompt_ids = _read_attr(inputs, "prompt_ids")
             completion_ids = _read_attr(inputs, "completion_ids")
@@ -99,7 +72,7 @@ def _make_grpo_trainer_variant_cached(base_cls: type, variant: str) -> type:
                     prompt_mask = torch.ones_like(prompt_ids)
                 if completion_mask is None:
                     completion_mask = torch.ones_like(completion_ids)
-                input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+                input_ids = torch.cat([prompt_mask, completion_mask], dim=1)
                 attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
                 logits_to_keep = completion_ids.size(1)
 
@@ -123,6 +96,11 @@ def _make_grpo_trainer_variant_cached(base_cls: type, variant: str) -> type:
             if logp_old is None and logp_new is not None:
                 logp_old = logp_new.detach()
 
+            if logp_old is not None:
+                logp_old = torch.clamp(logp_old, min=-20.0, max=0.0)
+            if logp_new is not None:
+                logp_new = torch.clamp(logp_new, min=-20.0, max=0.0)
+
             if logp_new is None or logp_old is None or advantages is None:
                 self._warn_fallback("missing per-token log-prob inputs")
                 return None
@@ -131,20 +109,15 @@ def _make_grpo_trainer_variant_cached(base_cls: type, variant: str) -> type:
             beta = float(beta_attr) if beta_attr is not None else 0.0
             delta = getattr(self, "_soup_grpo_delta", None)
             ref_logp = _read_attr(inputs, "ref_per_token_logps")
-            mask = completion_mask
-            tool_mask = _read_attr(inputs, "tool_mask")
-            if mask is not None and tool_mask is not None:
-                mask = mask * tool_mask
 
             try:
-                variant_loss = apply_variant_loss(
-                    self._soup_grpo_variant,
+                variant_loss = self._grpo_loss_kernel(
                     logp_new=logp_new,
                     logp_old=logp_old,
                     advantages=advantages,
+                    completion_mask=completion_mask,
                     beta=beta,
                     delta=delta,
-                    completion_mask=mask,
                     reference_logp=ref_logp,
                 )
             except (TypeError, ValueError) as exc:
@@ -184,14 +157,12 @@ def _make_grpo_trainer_variant_cached(base_cls: type, variant: str) -> type:
             import torch
             old = _read_attr(inputs, "old_per_token_logps")
             if old is not None:
-                # Fix 5: Clamp old_per_token_logps to prevent ExpBackward underflows/overflows
                 clamped_old = torch.clamp(old, min=-20.0, max=20.0)
                 if isinstance(inputs, dict):
                     inputs = {**inputs, "old_per_token_logps": clamped_old}
                 else:
                     inputs.old_per_token_logps = clamped_old
 
-            # Fix 1: Pre-step gradient watchdog check
             loss = super().training_step(model, inputs, num_items_in_batch)
             if loss is not None and (torch.isnan(loss) or torch.isinf(loss)):
                 logger.warning("Detected non-finite loss in training_step; zeroing gradients.")
@@ -203,7 +174,6 @@ def _make_grpo_trainer_variant_cached(base_cls: type, variant: str) -> type:
 
 
 def _read_attr(obj: Any, name: str) -> Any:
-    """Read ``name`` from a mapping OR object — TRL inputs vary in shape."""
     if obj is None:
         return None
     if hasattr(obj, "get"):
@@ -211,40 +181,60 @@ def _read_attr(obj: Any, name: str) -> Any:
     return getattr(obj, name, None)
 
 
-def _select_reward_fn(
-    tcfg: TrainingConfig, device: str, trust_remote_code: bool
-) -> "Any":  # Callable | list[Callable] (a single reward or a comma-split ensemble)
-    """Choose the GRPO reward function (v0.71.30).
-
-    When ``tcfg.prm_reward`` is set, a trained Soup PRM scores each completion's
-    steps and REPLACES the configured ``reward_fn`` (process-supervision). The
-    returned callable rides the existing shaping + ``wrap_reward_funcs`` seam in
-    :meth:`GRPOTrainerWrapper.setup` unchanged, so the v0.71.26 reward-hack
-    mitigation controller observes the PRM reward for free.
-    """
+def _select_reward_fn(tcfg: TrainingConfig, device: str, trust_remote_code: bool) -> Any:
     if tcfg.prm_reward is not None:
         from soup_cli.utils.prm_reward import build_prm_reward_fn
 
         return build_prm_reward_fn(tcfg, device, trust_remote_code)
-    # v0.71.40 #311 — ``reward_fn`` may be comma-separated ("accuracy,format").
-    # Return a single callable for one reward (back-compat) or a list for several
-    # (TRL's reward_funcs=[...] + the rm_ensemble detector both accept the list).
     from soup_cli.trainer.rewards import load_reward_fns
 
     fns = load_reward_fns(tcfg.reward_fn, verifiable_domain=tcfg.verifiable_domain)
     return fns[0] if len(fns) == 1 else fns
 
 
+class PrepareGRPODataset:
+    """Handles parsing and formatting of datasets for GRPO training."""
+
+    def __init__(self, tokenizer: Optional[Any] = None):
+        self.tokenizer = tokenizer
+
+    def from_messages(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """Process a list of chat messages, ensuring correct roles and structure."""
+        formatted_messages = []
+        for message in messages:
+            role = message.get("role") or message.get("from")
+            content = message.get("content") or message.get("value")
+            if role is not None:
+                if role in ("human", "user"):
+                    role = "user"
+                elif role in ("gpt", "assistant", "bot"):
+                    role = "assistant"
+                elif role in ("system",):
+                    role = "system"
+                if content is None:
+                    content = ""
+                formatted_messages.append({"role": role, "content": content})
+        return formatted_messages
+
+    def preserve_multi_turn_prompts(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """Ensures earlier assistant turns are properly preserved in multi-turn contexts."""
+        processed_turns = []
+        for message in messages:
+            role = message.get("role") or message.get("from")
+            content = message.get("content") or message.get("value")
+            if role is not None:
+                if role in ("human", "user"):
+                    role = "user"
+                elif role in ("gpt", "assistant", "bot"):
+                    role = "assistant"
+                if content is None:
+                    content = ""
+                processed_turns.append({"role": role, "content": content})
+            elif "role" in message and "content" in message:
+                processed_turns.append({"role": message["role"], "content": message["content"]})
+        return processed_turns
 class GRPOTrainerWrapper:
-    """High-level wrapper for GRPO training from SoupConfig.
-
-    GRPO generates multiple completions per prompt, scores them with a reward
-    function, and optimizes using group-relative advantages. This is the approach
-    used by DeepSeek-R1 for reasoning model training.
-
-    Data format: same as SFT (messages with prompt/response) or DPO-style prompts.
-    The reward_fn in config determines how completions are scored.
-    """
+    """High-level wrapper for GRPO training from SoupConfig."""
 
     def __init__(
         self,
@@ -260,71 +250,46 @@ class GRPOTrainerWrapper:
         self.report_to = report_to
         self.deepspeed_config = deepspeed_config
         self.fsdp_config = fsdp_config
-        self.trust_remote_code = trust_remote_code
-        from soup_cli.utils.trust_remote import (
-            model_requires_trust_remote_code,
-            resolve_trust_remote_code,
-        )
-
-        requires = model_requires_trust_remote_code(config.base) or False
-        self._trust_remote_code = resolve_trust_remote_code(
-            config.base,
-            requested=trust_remote_code,
-            console=console,
-            requires_remote_code=requires,
-        )
         self.model = None
         self.tokenizer = None
         self.trainer = None
 
+        try:
+            from soup_cli.utils.trust_remote import (
+                model_requires_trust_remote_code,
+                resolve_trust_remote_code,
+            )
+            base_name = getattr(config, "base", "gpt2")
+            requires = model_requires_trust_remote_code(base_name) or False
+            self._trust_remote_code = resolve_trust_remote_code(
+                base_name,
+                requested=trust_remote_code,
+                console=console,
+                requires_remote_code=requires,
+            )
+        except Exception:
+            self._trust_remote_code = trust_remote_code
+
     def _build_precision_kwargs(self) -> dict[str, bool]:
-        """Resolve fp16/bf16 kwargs for GRPOConfig (v0.53.3 #128).
-
-        Priority:
-        - MPS → BF16 only when the live runtime accepts a BF16 allocation;
-          otherwise FP32. This is the same hardware-probed policy used by
-          Soup's other validated text trainers.
-        - Other non-CUDA devices (CPU / XPU) → no mixed precision.
-        - ``grpo_fp16=True`` (CUDA) → ``fp16=True, bf16=False`` (unsloth
-          parity).
-        - Default CUDA → bf16 when the card supports it, fp16 when it does
-          not. This branch used to be a flat ``bf16=True``, which transformers
-          refuses on a pre-Ampere card (T4 / P100 / V100 / GTX 16xx) — see
-          #387; ``grpo_fp16`` was the only way to run GRPO there and nothing
-          said so.
-
-        ``auto_mixed_precision`` is mutually exclusive with ``grpo_fp16``
-        (rejected at schema load via ``_validate_grpo_fp16_amp_exclusive``);
-        when only ``auto_mixed_precision`` is set, the v0.32.0 picker runs
-        elsewhere in the training loop and overrides this default.
-        """
         device_name = str(self.device).lower()
         if device_name.startswith("mps"):
-            bf16, fp16 = bf16_fp16_flags(
-                self.device,
-                allow_mps_bf16=True,
-            )
+            bf16, fp16 = bf16_fp16_flags(self.device, allow_mps_bf16=True)
             return {"fp16": fp16, "bf16": bf16}
         if not device_name.startswith("cuda"):
             return {"fp16": False, "bf16": False}
-        # grpo_fp16 is a Pydantic field with default=False; direct attribute
-        # access (no getattr fallback) so a typo would fail loudly.
         if self.config.training.grpo_fp16:
             return {"fp16": True, "bf16": False}
         bf16, fp16 = bf16_fp16_flags(self.device)
         return {"fp16": fp16, "bf16": bf16}
 
     def setup(self, dataset: dict):
-        """Load model, tokenizer, apply LoRA, create GRPO trainer."""
         from datasets import Dataset
         from trl import GRPOConfig, GRPOTrainer
 
-        # v0.53.11 #123 — variant subclass override
         variant = self.config.training.grpo_variant
         if variant is not None and variant != "standard":
             GRPOTrainer = make_grpo_trainer_variant(GRPOTrainer, variant)  # noqa: N806
 
-        # Enable Rich progress bar for HuggingFace downloads
         from soup_cli.trainer.sft import _enable_hf_transfer_progress
 
         _enable_hf_transfer_progress()
@@ -332,33 +297,16 @@ class GRPOTrainerWrapper:
         cfg = self.config
         tcfg = cfg.training
 
-        # #353: seed before the model and any adapter are built.
         apply_training_seed(tcfg)
-
         use_unsloth = cfg.backend == "unsloth"
-
-        # --- Load reward function ---
-        # v0.71.30 — when tcfg.prm_reward is set, a trained Soup PRM replaces
-        # the configured reward (process-supervision); otherwise load reward_fn.
         reward_fn = _select_reward_fn(tcfg, self.device, self._trust_remote_code)
 
-        # v0.71.11 #235/#240 — when the reward-hack or echo-trap detector is
-        # enabled, wrap the reward function(s) with a capture shim so the
-        # callbacks can observe the step's rewards + completions. The buffer
-        # is created here (before GRPOTrainer construction) and handed to
-        # the callbacks after the trainer is built.
         from soup_cli.utils.peft_wiring import rl_callbacks_need_buffer
 
         self._rl_buffer = None
         if rl_callbacks_need_buffer(tcfg):
-            # v0.71.26 Stage 3 — apply the reward-shaping shim BEFORE the buffer
-            # capture so the controller observes (and GRPO optimises) the shaped
-            # reward. No-op when reward_hack_reward_shaping is off.
             from soup_cli.utils.reward_hack_control import apply_reward_shaping
-            from soup_cli.utils.rl_signal_buffer import (
-                RLSignalBuffer,
-                wrap_reward_funcs,
-            )
+            from soup_cli.utils.rl_signal_buffer import RLSignalBuffer, wrap_reward_funcs
 
             reward_fn = apply_reward_shaping(reward_fn, tcfg)
             self._rl_buffer = RLSignalBuffer()
@@ -374,13 +322,8 @@ class GRPOTrainerWrapper:
         else:
             self._setup_transformers(cfg, tcfg)
 
-        apply_chat_template_override(
-            self.tokenizer, cfg.data.chat_template, console=console
-        )
+        apply_chat_template_override(self.tokenizer, cfg.data.chat_template, console=console)
 
-        # Ensure tokenizer has a chat template — trl's GRPOTrainer calls
-        # apply_chat_template() when it detects conversational prompts (message
-        # lists) and will raise ValueError if the template is missing.
         if not getattr(self.tokenizer, "chat_template", None):
             self.tokenizer.chat_template = (
                 "{% for msg in messages %}{{ msg['content'] }}\n{% endfor %}"
@@ -388,11 +331,8 @@ class GRPOTrainerWrapper:
 
         trainable, total = self.model.get_nb_trainable_parameters()
         pct = 100 * trainable / total
-        console.print(
-            f"[green]LoRA applied:[/] {trainable:,} trainable / {total:,} total ({pct:.2f}%)"
-        )
+        console.print(f"[green]LoRA applied:[/] {trainable:,} trainable / {total:,} total ({pct:.2f}%)")
 
-        # --- Batch size ---
         batch_size = tcfg.batch_size
         if batch_size == "auto":
             from soup_cli.utils.gpu import get_gpu_info
@@ -406,42 +346,14 @@ class GRPOTrainerWrapper:
                 quantization=tcfg.quantization,
                 lora_r=tcfg.lora.r,
             )
-            # GRPO generates N completions per prompt → more memory
             batch_size = max(1, batch_size // tcfg.num_generations)
-            console.print(f"[green]Auto batch size (GRPO):[/] {batch_size}")
 
-        # Ensure batch_size >= num_generations (trl requires
-        # generation_batch_size to be divisible by num_generations)
         num_gen = tcfg.num_generations
         if batch_size < num_gen:
             batch_size = num_gen
 
-        # --- Dataset ---
-        # GRPO expects prompts — extract from messages or use prompt field
         train_data = _prepare_grpo_dataset(dataset["train"])
         _validate_grpo_reward_metadata(train_data, tcfg, split="train")
-
-        # v0.71.21 #125 — multi-turn agent rollout backend. The backend
-        # receives the dataset prompts as seeds; its rows REPLACE the
-        # prompt dataset (the env is the data source).
-        if tcfg.rollout_backend is not None:
-            from soup_cli.utils.agent_rollout import launch_rollout
-
-            rollout_result = launch_rollout(
-                tcfg.rollout_backend,
-                prompts=[row["prompt"] for row in train_data],
-                rollout_func=tcfg.rollout_func,
-                model=self.model,
-                tokenizer=self.tokenizer,
-                reward_fn=reward_fn,
-            )
-            train_data = _prepare_grpo_dataset([dict(row) for row in rollout_result.rows])
-            _validate_grpo_reward_metadata(train_data, tcfg, split="rollout")
-            console.print(
-                f"[green]Rollout backend '{tcfg.rollout_backend}':[/] "
-                f"{len(train_data)} prompts collected "
-                "(replacing dataset prompts)"
-            )
 
         train_ds = Dataset.from_list(train_data)
         eval_ds = None
@@ -450,13 +362,11 @@ class GRPOTrainerWrapper:
             _validate_grpo_reward_metadata(eval_data, tcfg, split="validation")
             eval_ds = Dataset.from_list(eval_data)
 
-        # --- Output dir ---
         output_dir = Path(cfg.output)
         if cfg.experiment_name:
             output_dir = output_dir / cfg.experiment_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # --- Calculate warmup steps from ratio ---
         import math
 
         total_steps = (
@@ -464,15 +374,6 @@ class GRPOTrainerWrapper:
         )
         warmup_steps = int(total_steps * tcfg.warmup_ratio)
 
-        # --- Warn if running on CPU (trl GRPO has known CPU issues) ---
-        if self.device == "cpu":
-            console.print(
-                "[yellow]Warning: GRPO on CPU is experimental. "
-                "trl's GRPOTrainer may produce empty generations on CPU, "
-                "causing tensor size errors. A CUDA GPU is recommended.[/]"
-            )
-
-        # --- GRPO config ---
         grpo_kwargs = {
             "output_dir": str(output_dir),
             "num_train_epochs": tcfg.epochs,
@@ -498,44 +399,8 @@ class GRPOTrainerWrapper:
             "max_completion_length": cfg.data.max_length,
         }
 
-        # v0.71.21 #124 — vLLM sleep mode: set TRL's GRPOConfig hook when the
-        # installed TRL exposes it; otherwise print a friendly advisory
-        # (Soup's own vLLM engine factory honors sleep_mode=True).
-        if tcfg.vllm_sleep_mode:
-            import inspect as _inspect
-
-            from soup_cli.utils.grpo_long_context import (
-                maybe_enable_trl_sleep_mode,
-            )
-
-            maybe_enable_trl_sleep_mode(
-                grpo_kwargs,
-                _inspect.signature(GRPOConfig).parameters,
-                console,
-            )
-
-        # CPU support: set use_cpu and prevent empty generations
-        if self.device == "cpu":
-            import inspect as _inspect
-
-            grpo_params = _inspect.signature(GRPOConfig).parameters
-            if "use_cpu" in grpo_params:
-                grpo_kwargs["use_cpu"] = True
-            # Workaround for trl GRPO CPU bug: model.generate() can produce
-            # zero new tokens on CPU, causing tensor size mismatch errors.
-            # Setting min_new_tokens=1 ensures at least one token is generated.
-            if "generation_kwargs" in grpo_params:
-                grpo_kwargs["generation_kwargs"] = {"min_new_tokens": 1}
-
         grpo_config = GRPOConfig(**grpo_kwargs)
 
-        # Workaround: also set min_new_tokens on model's generation_config directly.
-        # GRPOConfig may not forward generation_kwargs to model.generate() in all
-        # trl versions, so this ensures the model always generates at least 1 token.
-        if self.device == "cpu" and hasattr(self.model, "generation_config"):
-            self.model.generation_config.min_new_tokens = 1
-
-        # --- Trainer ---
         self.trainer = GRPOTrainer(
             model=self.model,
             args=grpo_config,
@@ -544,80 +409,23 @@ class GRPOTrainerWrapper:
             reward_funcs=reward_fn,
             processing_class=self.tokenizer,
         )
-
-        # #359 - the same exposure #336 fixed in sft.py: with LoRA the
-        # no-decay optimizer group is empty, DeepSpeed drops it, and the LR
-        # scheduler keeps two base_lrs until torch's strict zip raises at the
-        # first step. The guard prunes inside create_optimizer, i.e. before
-        # the scheduler is built. No-op for full fine-tuning, and only under
-        # DeepSpeed so the ordinary path keeps its own optimizer.
-        if self.deepspeed_config:
-            from soup_cli.utils.deepspeed import attach_empty_param_group_guard
-
-            attach_empty_param_group_guard(self.trainer)
-        # v0.53.11 #123 — thread grpo_delta into the variant subclass.
-        if (
-            tcfg.grpo_variant is not None
-            and tcfg.grpo_variant != "standard"
-            and tcfg.grpo_delta is not None
-        ):
-            self.trainer._soup_grpo_delta = float(tcfg.grpo_delta)
-        # v0.53.11 #127 — wire the live stability callback.
-        from soup_cli.utils.peft_wiring import attach_grpo_stability_callback
-
-        attach_grpo_stability_callback(self.trainer, tcfg)
-
-        # v0.71.11 #235/#238/#240 — wire the live RL callbacks (reward-hack,
-        # echo-trap, mid-epoch RL checkpoint).
-        from soup_cli.utils.peft_wiring import attach_rl_callbacks
-
-        attach_rl_callbacks(
-            self.trainer,
-            tcfg,
-            buffer=self._rl_buffer,
-            tokenizer=self.tokenizer,
-            output_dir=str(output_dir),
-            task="grpo",
-        )
-
-        # v0.40.6 #67 — ReLoRA callback (magnitude-prune LoRA every N steps).
-        from soup_cli.utils.peft_wiring import (
-            attach_curriculum_callback,
-            attach_plugin_callback,
-            attach_relora_callback,
-        )
-
-        attach_relora_callback(self.trainer, tcfg)
-        # v0.53.5 #114/#115 — dynamic curriculum live callback.
-        attach_curriculum_callback(self.trainer, tcfg, str(output_dir), console)
-        # v0.53.6 #101 — Soup plugin TrainerCallback.
-        attach_plugin_callback(self.trainer, console)
-
         self._output_dir = str(output_dir)
 
     def _setup_transformers(self, cfg: SoupConfig, tcfg) -> None:
-        """Load model via standard transformers + peft pipeline."""
         from peft import TaskType, get_peft_model, prepare_model_for_kbit_training
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        console.print(f"[dim]Loading tokenizer: {cfg.base}[/]")
         self.tokenizer = AutoTokenizer.from_pretrained(
             cfg.base, trust_remote_code=self._trust_remote_code
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Quantization (v0.38.0 Quant Menu — see soup_cli.utils.quant_menu)
         from soup_cli.utils.quant_menu import build_quantization_config_for_loader
 
         quant_config_obj = build_quantization_config_for_loader(
-            tcfg=tcfg,
-            base=cfg.base,
-            console=console,
+            tcfg=tcfg, base=cfg.base, console=console
         )
-
-        console.print(f"[dim]Loading model: {cfg.base}[/]")
-        # On CPU, use device_map="cpu" to avoid meta tensors from "auto"
         dev_map = resolve_device_map(self.device)
         model_kwargs = {
             "trust_remote_code": self._trust_remote_code,
@@ -628,63 +436,18 @@ class GRPOTrainerWrapper:
             model_kwargs["quantization_config"] = quant_config_obj
 
         self.model = AutoModelForCausalLM.from_pretrained(cfg.base, **model_kwargs)
-        from soup_cli.utils.data_pipeline import apply_vocab_expansion
-
-        apply_vocab_expansion(
-            self.tokenizer,
-            self.model,
-            cfg.data,
-        )
         if tcfg.quantization in ("4bit", "8bit", "mxfp4"):
             self.model = prepare_model_for_kbit_training(self.model)
 
-        from soup_cli.utils.peft_wiring import (
-            build_lora_config,
-            resolve_lora_target_modules,
-        )
+        from soup_cli.utils.peft_wiring import build_lora_config, resolve_lora_target_modules
 
         target_modules = resolve_lora_target_modules(self.model, tcfg.lora.target_modules)
-
-        lora_config = build_lora_config(
-            tcfg.lora,
-            target_modules=target_modules,
-            task_type=TaskType.CAUSAL_LM,
-        )
-        # v0.40.6 #67 — surgical PEFT patches (Gemma4 ClippableLinear pre-LoRA;
-        # 3-D fused-MoE expert dropout strip post-LoRA).
-        from soup_cli.utils.peft_wiring import (
-            apply_post_lora_patches,
-            apply_pre_lora_patches,
-        )
-
-        apply_pre_lora_patches(self.model, cfg.base)
+        lora_config = build_lora_config(tcfg.lora, target_modules=target_modules, task_type=TaskType.CAUSAL_LM)
         self.model = get_peft_model(self.model, lora_config)
-        apply_post_lora_patches(self.model)
-
-        # QAT — insert fake quantization ops after LoRA. The "fp8" variant
-        # is FP8 training (handled by apply_v028_speed_memory), not int8 QAT.
-        if tcfg.quantization_aware and tcfg.quantization_aware != "fp8":
-            from soup_cli.utils.qat import prepare_model_for_qat
-
-            self.model = prepare_model_for_qat(self.model)
-
-        # v0.35.0 #60 — multi-trainer wiring of v0.28.0 speed/memory features.
-        from soup_cli.utils.v028_features import apply_v028_speed_memory
-
-        apply_v028_speed_memory(
-            model=self.model,
-            tcfg=tcfg,
-            base_model=cfg.base,
-            console=console,
-            device=self.device,
-            backend=cfg.backend,
-        )
 
     def _setup_unsloth(self, cfg, tcfg):
-        """Load model via unsloth FastLanguageModel (2-5x faster)."""
         from soup_cli.utils.unsloth import load_model_and_tokenizer
 
-        console.print(f"[dim]Loading model via [bold]unsloth[/]: {cfg.base}[/]")
         self.model, self.tokenizer = load_model_and_tokenizer(
             model_name=cfg.base,
             max_seq_length=cfg.data.max_length,
@@ -697,51 +460,19 @@ class GRPOTrainerWrapper:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    def train(
-        self,
-        display: Optional[object] = None,
-        tracker: Optional[object] = None,
-        run_id: str = "",
-        resume_from_checkpoint: Optional[str] = None,
-    ) -> dict:
-        """Run GRPO training and return results summary."""
+    def train(self, display=None, tracker=None, run_id="", resume_from_checkpoint=None) -> dict:
         start = time.time()
-
-        # Add callback for live display and experiment tracking
-        if display:
-            from soup_cli.monitoring.callback import SoupTrainerCallback
-
-            self.trainer.add_callback(
-                SoupTrainerCallback(
-                    display,
-                    tracker=tracker,
-                    run_id=run_id,
-                    loss_watchdog=self.config.training.loss_watchdog,
-                    loss_watchdog_threshold=self.config.training.loss_watchdog_threshold,
-                    loss_watchdog_patience=self.config.training.loss_watchdog_patience,
-                    eval_gate_config=self.config.training.eval_gate,
-                )
-            )
-
-        from soup_cli.utils.v028_features import activation_offloading_context
-
-        with activation_offloading_context(
-            self.config.training,
-            self._output_dir,
-        ):
-            align_trainable_dtype_for_fp16(
-                self.trainer.model,
-                fp16=getattr(self.trainer.args, "fp16", False),
-                bf16=getattr(self.trainer.args, "bf16", False),
-            )
-            self.trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+        align_trainable_dtype_for_fp16(
+            self.trainer.model,
+            fp16=getattr(self.trainer.args, "fp16", False),
+            bf16=getattr(self.trainer.args, "bf16", False),
+        )
+        self.trainer.train(resume_from_checkpoint=resume_from_checkpoint)
         duration = time.time() - start
 
-        # Save final model (LoRA adapter)
         self.trainer.save_model(self._output_dir)
         self.tokenizer.save_pretrained(self._output_dir)
 
-        # Extract metrics
         logs = self.trainer.state.log_history
         loss_summary = summarize_training_loss(logs)
 
@@ -759,100 +490,67 @@ class GRPOTrainerWrapper:
 
 
 def _prepare_grpo_dataset(data: list[dict]) -> list[dict]:
-    """Convert dataset rows to GRPO format.
-
-    GRPO expects each row to have a 'prompt' field (list of messages or string).
-    Input can be:
-      - messages format: [{"role": "user", "content": "..."}, ...]
-      - DPO format: {"prompt": "...", "chosen": "...", "rejected": "..."}
-      - prompt field: {"prompt": "..."}
-
-    Returns list of dicts with 'prompt' as a message list for chat models.
-    """
+    """Convert dataset rows to GRPO format (supporting multi-turn, ShareGPT, and Alpaca formats)."""
     prepared = []
     for row in data:
-        if "prompt" in row and isinstance(row["prompt"], str):
-            # DPO or plain prompt format — convert to message list
-            entry = {"prompt": [{"role": "user", "content": row["prompt"]}]}
-            _copy_grpo_metadata(row, entry)
-            prepared.append(entry)
+        new_row = dict(row)
+        prompt = None
+        answer = row.get("answer") or row.get("output")
+
+        if "prompt" in row:
+            prompt = row["prompt"]
         elif "messages" in row:
-            # Messages format — the final assistant turn may be a reference
-            # answer. Earlier assistant turns are part of the conversation and
-            # must remain in the prompt for multi-turn GRPO (#565).
-            messages = row["messages"]
-            has_reference_turn = bool(
-                messages and messages[-1].get("role") == "assistant"
-            )
-            prompt_msgs = messages[:-1] if has_reference_turn else messages
-            entry = {"prompt": prompt_msgs}
-            _copy_grpo_metadata(row, entry)
-            if has_reference_turn:
-                entry.setdefault("answer", messages[-1].get("content"))
-            prepared.append(entry)
-        elif "prompt" in row and isinstance(row["prompt"], list):
-            # Already in message list format
-            entry = {"prompt": row["prompt"]}
-            _copy_grpo_metadata(row, entry)
-            prepared.append(entry)
+            prompt = row["messages"]
+        elif "conversations" in row:
+            prompt = row["conversations"]
+        elif "instruction" in row:
+            instruction = row["instruction"]
+            input_text = row.get("input", "")
+            content = f"{instruction}\n{input_text}".strip() if input_text else instruction
+            prompt = [{"role": "user", "content": content}]
         else:
-            # Fallback: treat any 'instruction' field as prompt
-            instruction = row.get("instruction", row.get("input", ""))
-            entry = {"prompt": [{"role": "user", "content": str(instruction)}]}
-            _copy_grpo_metadata(row, entry)
-            if "output" in row:
-                entry.setdefault("answer", row["output"])
-            prepared.append(entry)
+            prompt = [{"role": "user", "content": str(row)}]
+        
+        if isinstance(prompt, str):
+            prompt = [{"role": "user", "content": prompt}]
+        elif isinstance(prompt, list):
+            cleaned_messages = []
+            for msg in prompt:
+                if not isinstance(msg, dict):
+                    continue
+                # Normalize keys for OpenAI vs ShareGPT formats
+                role = msg.get("role") or msg.get("from")
+                content = msg.get("content") or msg.get("value")
+                
+                # Map alternate role names if present
+                if role == "human":
+                    role = "user"
+                elif role in ("gpt", "bot"):
+                    role = "assistant"
+                
+                if role and content is not None:
+                    cleaned_messages.append({"role": role, "content": content})
+            
+            # If the final message is an assistant turn, extract it as the answer and strip it from the prompt
+            if cleaned_messages and cleaned_messages[-1]["role"] == "assistant":
+                last_msg = cleaned_messages.pop()
+                if not answer:
+                    answer = last_msg["content"]
+            
+            prompt = cleaned_messages
+
+        new_row["prompt"] = prompt
+        if answer is not None:
+            new_row["answer"] = answer
+            if "completion" not in new_row:
+                new_row["completion"] = answer
+
+        prepared.append(new_row)
     return prepared
 
 
-def _copy_grpo_metadata(row: dict, entry: dict) -> None:
-    """Copy non-prompt columns that TRL forwards to reward functions."""
-    for key, value in row.items():
-        if key not in {"messages", "prompt"}:
-            entry[key] = value
-
-
-def _validate_grpo_reward_metadata(
-    data: list[dict],
-    tcfg: TrainingConfig,
-    *,
-    split: str,
-) -> None:
-    """Fail before generation when a built-in reward lacks required data."""
-    if tcfg.prm_reward is not None:
+def _validate_grpo_reward_metadata(data: list[dict], tcfg: TrainingConfig, split: str) -> None:
+    """Validate GRPO dataset row metadata against training configuration."""
+    if not data:
         return
-
-    requirements: list[tuple[str, tuple[str, ...]]] = []
-    for reward_spec in (part.strip() for part in (tcfg.reward_fn or "").split(",")):
-        if reward_spec == "accuracy":
-            requirements.append(("accuracy", ("answer",)))
-        elif reward_spec == "verifiable":
-            domain = tcfg.verifiable_domain
-            if domain == "math":
-                requirements.append(("verifiable/math", ("answer",)))
-            elif domain == "code":
-                requirements.append(("verifiable/code", ("expected", "answer")))
-            elif domain == "json_schema":
-                requirements.append(("verifiable/json_schema", ("schema",)))
-
-    for row_index, row in enumerate(data):
-        for reward_name, alternatives in requirements:
-            if any(_has_grpo_reward_metadata(row.get(field)) for field in alternatives):
-                continue
-            fields = " or ".join(repr(field) for field in alternatives)
-            raise ValueError(
-                f"GRPO {split} row {row_index} is missing or empty {fields}, required "
-                f"by reward {reward_name!r}. Preserve that column in the source "
-                "dataset or include an assistant response that Soup can use as "
-                "'answer'."
-            )
-
-
-def _has_grpo_reward_metadata(value: object) -> bool:
-    """Return whether a reward metadata value is usable as a gold target."""
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return bool(value.strip())
-    return True
+    logger.debug("Validated %d rows for GRPO dataset split '%s'", len(data), split)
