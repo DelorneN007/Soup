@@ -14,7 +14,7 @@ license = "Apache-2.0"
 # libc10.so before any Soup code executes, so the user has nothing to act on.
 # `tests/test_requires_python_bound.py` derives this bound from the CI matrix, so
 # widening one without the other fails the suite.
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.10"
 authors = [
     { name = "Soup Team", email = "team@trysoup.dev" },
 ]

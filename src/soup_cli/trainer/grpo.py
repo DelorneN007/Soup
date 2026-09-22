@@ -139,13 +139,9 @@ def _make_grpo_trainer_variant_cached(base_cls: type, variant: str) -> type:
             loss = self._compute_variant_loss(model, inputs)
             if loss is not None:
                 return loss
-            if hasattr(super(), "_compute_loss"):
-                return super()._compute_loss(model, inputs)
             return super().compute_loss(model, inputs)
 
         def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-            if hasattr(super(), "_compute_loss"):
-                return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
             loss = self._compute_variant_loss(model, inputs)
             if loss is not None:
                 if return_outputs:
@@ -233,6 +229,11 @@ class PrepareGRPODataset:
             elif "role" in message and "content" in message:
                 processed_turns.append({"role": message["role"], "content": message["content"]})
         return processed_turns
+<<<<<<< HEAD
+=======
+
+
+>>>>>>> 19cbf02 (fix(trainer): update configuration and dataset preparation safeguards)
 class GRPOTrainerWrapper:
     """High-level wrapper for GRPO training from SoupConfig."""
 
@@ -505,7 +506,11 @@ class GRPOTrainerWrapper:
                 bf16=getattr(self.trainer.args, "bf16", False),
             )
             self.trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+<<<<<<< HEAD
          320cc5c (fix(trainer): unify callback kwargs across all trainers (#1023))
+=======
+
+>>>>>>> 19cbf02 (fix(trainer): update configuration and dataset preparation safeguards)
         duration = time.time() - start
 
         self.trainer.save_model(self._output_dir)
@@ -591,4 +596,8 @@ def _validate_grpo_reward_metadata(data: list[dict], tcfg: TrainingConfig, split
     """Validate GRPO dataset row metadata against training configuration."""
     if not data:
         return
+<<<<<<< HEAD
     logger.debug("Validated %d rows for GRPO dataset split '%s'", len(data), split)
+=======
+    logger.debug("Validated %d rows for GRPO dataset split '%s'", len(data), split)
+>>>>>>> 19cbf02 (fix(trainer): update configuration and dataset preparation safeguards)
